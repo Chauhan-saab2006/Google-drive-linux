@@ -1,0 +1,15 @@
+[Unit]
+Description=Google Drive Linux Virtual Filesystem Daemon
+Documentation=https://github.com/your-org/google-drive-linux
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/google-drive-linux daemon
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=20s
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,25 @@
+# Maintainer: Google Drive Linux Contributors
+pkgname=google-drive-linux-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Native Google Drive client and FUSE virtual filesystem for Linux"
+arch=('x86_64')
+url="https://github.com/google-drive-linux"
+license=('Apache-2.0')
+depends=('fuse3' 'gtk4' 'libadwaita' 'sqlite' 'openssl')
+provides=('google-drive-linux')
+conflicts=('google-drive-linux')
+source=(
+    "file://google-drive-linux"
+    "file://google-drive-linux.desktop"
+    "file://google-drive-linux.svg"
+    "file://google-drive-linux.service"
+)
+sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP')
+
+package() {
+    install -Dm755 "${srcdir}/google-drive-linux" "${pkgdir}/usr/bin/google-drive-linux"
+    install -Dm644 "${srcdir}/google-drive-linux.desktop" "${pkgdir}/usr/share/applications/google-drive-linux.desktop"
+    install -Dm644 "${srcdir}/google-drive-linux.svg" "${pkgdir}/usr/share/icons/hicolor/scalable/apps/google-drive-linux.svg"
+    install -Dm644 "${srcdir}/google-drive-linux.service" "${pkgdir}/usr/lib/systemd/user/google-drive-linux.service"
+}

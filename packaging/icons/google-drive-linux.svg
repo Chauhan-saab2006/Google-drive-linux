@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1e1e2e"/>
+      <stop offset="100%" stop-color="#11111b"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+  </defs>
+
+  <!-- Squircle Base for modern GNOME/KDE aesthetics -->
+  <rect x="32" y="32" width="448" height="448" rx="96" ry="96" fill="url(#bgGrad)"/>
+
+  <!-- Subtle Rim Glow -->
+  <rect x="32" y="32" width="448" height="448" rx="96" ry="96" fill="none" stroke="#45475a" stroke-width="3" opacity="0.6"/>
+
+  <!-- Google Drive Triangle Geometry with Shadows -->
+  <g filter="url(#shadow)" transform="translate(4, 8)">
+    <!-- Yellow Top Bar (Right) -->
+    <path d="M 334 140 L 442 328 L 362 328 L 254 140 Z" fill="#FFC107"/>
+    <!-- Blue Left/Bottom Bar -->
+    <path d="M 178 140 L 334 140 L 254 280 L 98 280 Z" fill="#4285F4"/>
+    <!-- Green Bottom/Left Bar -->
+    <path d="M 70 328 L 178 140 L 220 214 L 112 402 Z" fill="#0F9D58"/>
+    <!-- Overlap Shadows and Highlights -->
+    <path d="M 178 140 L 254 140 L 176 276 L 98 280 Z" fill="#1A73E8"/>
+    <path d="M 112 402 L 328 402 L 362 342 L 146 342 Z" fill="#0B8043"/>
+    <path d="M 328 402 L 442 328 L 404 262 L 290 336 Z" fill="#F9A825"/>
+  </g>
+
+  <!-- Subtle Virtual Disk Plate overlay -->
+  <circle cx="256" cy="272" r="32" fill="#ffffff" opacity="0.15"/>
+  <circle cx="256" cy="272" r="12" fill="#ffffff" opacity="0.4"/>
+</svg>

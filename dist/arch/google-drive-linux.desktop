@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Google Drive
+Comment=Mount and access your Google Drive as a local disk
+Exec=google-drive-linux
+Icon=google-drive-linux
+Terminal=false
+Type=Application
+Categories=Network;FileTransfer;Utility;
+Keywords=Google;Drive;Cloud;FUSE;Sync;Storage;
+StartupNotify=true

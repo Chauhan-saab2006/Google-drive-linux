@@ -1,0 +1,25 @@
+# Sample Configuration for Google Drive Linux
+# Location: ~/.config/google-drive-linux/config.toml
+
+# Directory where Google Drive will be mounted as a FUSE virtual disk
+mount_point = "/home/user/GoogleDrive"
+
+# Directory for local database and file chunk cache
+cache_dir = "/home/user/.cache/google-drive-linux"
+
+# Maximum size in megabytes allocated for cached files (default: 5120 MB / 5 GB)
+cache_size_mb = 5120
+
+# Automatically start the background service upon user desktop login
+auto_start = false
+
+# Automatically mount Google Drive when the application or service starts
+auto_mount = true
+
+# Log level: trace, debug, info, warn, error
+log_level = "info"
+
+# Optional: Google Cloud OAuth 2.0 Desktop Client Credentials
+# Can also be provided via CLI (--client-id) or environment variables (GOOGLE_CLIENT_ID)
+# client_id = "your-client-id.apps.googleusercontent.com"
+# client_secret = "your-client-secret"
