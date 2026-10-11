@@ -1,6 +1,35 @@
+# Rust / Cargo build artifacts
 /target/
-Cargo.lock
 **/*.rs.bk
+Cargo.lock
+
+# Distribution & Package Outputs
+/dist/
+*.pkg.tar.zst
+*.tar.gz
+
+# Local user configuration & secrets
+config/config.toml
+credentials.json
+*.key
+*.pem
+*.token
+
+# Local runtime & cache files
+*.db
+*.db-wal
+*.db-shm
+staging/
+.cache/
+
+# IDE & Editor files
+.vscode/
+.idea/
 *.swp
+*.swo
 *~
 .DS_Store
+
+# Logs & temp files
+*.log
+/tmp/
