@@ -6,9 +6,9 @@ xdata = pkgtype=pkg
 pkgver = 0.1.0-1
 pkgdesc = Native Google Drive client and FUSE virtual filesystem for Linux
 url = https://github.com/google-drive-linux
-builddate = 1791707353
+builddate = 1791966063
 packager = Unknown Packager
-size = 11629844
+size = 11670972
 arch = x86_64
 license = Apache-2.0
 conflict = google-drive-linux

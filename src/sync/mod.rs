@@ -196,7 +196,10 @@ impl SyncEngine {
                         let _ = cache_guard.delete_chunk(&file_id);
                         let _ = cache_guard.delete_file_record(&file_id);
                     } else {
-                        debug!("Change event: file {} updated remotely ({})", file_id, drive_file.name);
+                        debug!(
+                            "Change event: file {} updated remotely ({})",
+                            file_id, drive_file.name
+                        );
                         // Invalidate cached chunk since content or metadata changed remotely
                         let _ = cache_guard.delete_chunk(&file_id);
                         let size = drive_file.size_bytes();
@@ -240,11 +243,14 @@ impl SyncEngine {
             return Ok(0);
         }
 
-        info!("Flushing {} pending offline sync tasks to Google Drive", tasks.len());
+        info!(
+            "Flushing {} pending offline sync tasks to Google Drive",
+            tasks.len()
+        );
         let mut completed = 0;
         let mut remaining = Vec::new();
 
-        for (_idx, task) in tasks.into_iter().enumerate() {
+        for task in tasks {
             match self.execute_sync_task(&task).await {
                 Ok(_) => {
                     completed += 1;
@@ -301,7 +307,10 @@ impl SyncEngine {
                     .map_err(|e| e.to_string())?;
                 Ok(())
             }
-            SyncTask::Download { file_id, target_path } => {
+            SyncTask::Download {
+                file_id,
+                target_path,
+            } => {
                 let data = self
                     .client
                     .download_file(file_id)

@@ -11,6 +11,11 @@ cp -f "$SCRIPT_DIR/google-drive-linux" "$HOME/.local/bin/google-drive-linux"
 chmod +x "$HOME/.local/bin/google-drive-linux"
 echo "✓ Installed executable to ~/.local/bin/google-drive-linux"
 
+# Ensure ~/.local/bin is in PATH for desktop sessions if needed
+if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
+    echo "ℹ Note: Make sure ~/.local/bin is in your PATH."
+fi
+
 # 2. Install icon
 ICON_DIR="$HOME/.local/share/icons/hicolor/scalable/apps"
 mkdir -p "$ICON_DIR"
@@ -29,7 +34,7 @@ mkdir -p "$SERVICE_DIR"
 cp -f "$SCRIPT_DIR/google-drive-linux.service" "$SERVICE_DIR/google-drive-linux.service"
 echo "✓ Installed systemd service to ~/.config/systemd/user/google-drive-linux.service"
 
-# 5. Update desktop database
+# 5. Refresh caches
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database "$DESKTOP_DIR" || true
 fi
@@ -40,4 +45,4 @@ fi
 echo ""
 echo "Installation complete!"
 echo "Google Drive Linux is now available in your application launcher menu."
-echo "You can also run it from your terminal: google-drive-linux"
+echo "You can launch it from your app menu or terminal: google-drive-linux"

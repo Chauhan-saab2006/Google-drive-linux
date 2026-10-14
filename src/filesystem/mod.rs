@@ -148,7 +148,7 @@ impl InodeTable {
             drive_id_to_ino: HashMap::new(),
             parent_name_to_ino: HashMap::new(),
             children_of: HashMap::new(),
-            next_ino: AtomicU64::new(2),
+            next_ino: AtomicU64::new(4),
         };
 
         // Initialize root directory (ino = 1) mapped to Google Drive "root"
@@ -167,7 +167,50 @@ impl InodeTable {
         table
             .drive_id_to_ino
             .insert("root".to_string(), FUSER_ROOT_ID);
+
+        // Virtual .trackerignore & .nomedia to prevent desktop indexing engines
+        // (GNOME Tracker, KDE Baloo) from storming the remote FUSE mount.
+        let tracker_entry = InodeEntry {
+            ino: 2,
+            drive_id: "virtual_trackerignore".to_string(),
+            parent_ino: FUSER_ROOT_ID,
+            name: ".trackerignore".to_string(),
+            is_dir: false,
+            size: 0,
+            modified_time: SystemTime::now(),
+            mime_type: "text/plain".to_string(),
+        };
+        table.ino_to_entry.insert(2, tracker_entry);
         table
+            .drive_id_to_ino
+            .insert("virtual_trackerignore".to_string(), 2);
+        table
+            .parent_name_to_ino
+            .insert((FUSER_ROOT_ID, ".trackerignore".to_string()), 2);
+
+        let nomedia_entry = InodeEntry {
+            ino: 3,
+            drive_id: "virtual_nomedia".to_string(),
+            parent_ino: FUSER_ROOT_ID,
+            name: ".nomedia".to_string(),
+            is_dir: false,
+            size: 0,
+            modified_time: SystemTime::now(),
+            mime_type: "text/plain".to_string(),
+        };
+        table.ino_to_entry.insert(3, nomedia_entry);
+        table
+            .drive_id_to_ino
+            .insert("virtual_nomedia".to_string(), 3);
+        table
+            .parent_name_to_ino
+            .insert((FUSER_ROOT_ID, ".nomedia".to_string()), 3);
+
+        table
+    }
+
+    pub fn has_children_cached(&self, parent_ino: u64) -> bool {
+        self.children_of.contains_key(&parent_ino)
     }
 
     pub fn get_by_ino(&self, ino: u64) -> Option<InodeEntry> {
@@ -392,6 +435,58 @@ impl GoogleDriveFS {
     }
 
     fn fetch_children_from_drive(&self, parent_ino: u64, parent_drive_id: &str) -> Vec<InodeEntry> {
+        // Step 1: Check local SQLite cache first (fresh within 120s TTL)
+        if let Some(ref arc_cache) = self.cache {
+            if let Ok(cache) = arc_cache.lock() {
+                if cache
+                    .is_directory_fresh(parent_drive_id, Duration::from_secs(120))
+                    .unwrap_or(false)
+                {
+                    if let Ok(cached_files) = cache.get_children(Some(parent_drive_id)) {
+                        debug!(
+                            "SQLite directory cache HIT for {}: loaded {} files",
+                            parent_drive_id,
+                            cached_files.len()
+                        );
+                        let mut table = self.inodes.write().unwrap();
+                        let mut child_inos = Vec::with_capacity(cached_files.len() + 2);
+
+                        if parent_ino == FUSER_ROOT_ID {
+                            if let Some(ino) = table.get_child_ino(FUSER_ROOT_ID, ".trackerignore")
+                            {
+                                child_inos.push(ino);
+                            }
+                            if let Some(ino) = table.get_child_ino(FUSER_ROOT_ID, ".nomedia") {
+                                child_inos.push(ino);
+                            }
+                        }
+
+                        for rec in &cached_files {
+                            let drive_file = DriveFile {
+                                id: rec.drive_id.clone(),
+                                name: rec.name.clone(),
+                                mime_type: rec.mime_type.clone(),
+                                size: Some(rec.size.to_string()),
+                                modified_time: Some(rec.modified_time.clone()),
+                                created_time: None,
+                                parents: rec.parent_id.clone().map(|p| vec![p]),
+                                trashed: Some(false),
+                                web_view_link: None,
+                                md5_checksum: rec.etag.clone(),
+                                version: None,
+                            };
+                            let ino = table.insert_or_update(parent_ino, &drive_file);
+                            child_inos.push(ino);
+                        }
+
+                        table.set_children(parent_ino, child_inos);
+                        return table.get_children(parent_ino).unwrap_or_default();
+                    }
+                }
+            }
+        }
+
+        // Step 2: SQLite cache miss or stale; query remote Google Drive API
         let client = self.client.clone();
         let drive_id = parent_drive_id.to_string();
 
@@ -411,10 +506,7 @@ impl GoogleDriveFS {
                                 name: file.name.clone(),
                                 mime_type: file.mime_type.clone(),
                                 size: file.size_bytes(),
-                                modified_time: file
-                                    .modified_time
-                                    .clone()
-                                    .unwrap_or_default(),
+                                modified_time: file.modified_time.clone().unwrap_or_default(),
                                 etag: file.version.clone(),
                                 local_cache_path: None,
                                 sync_status: FileSyncStatus::MetadataOnly,
@@ -429,7 +521,16 @@ impl GoogleDriveFS {
                 }
 
                 let mut table = self.inodes.write().unwrap();
-                let mut child_inos = Vec::with_capacity(files.len());
+                let mut child_inos = Vec::with_capacity(files.len() + 2);
+
+                if parent_ino == FUSER_ROOT_ID {
+                    if let Some(ino) = table.get_child_ino(FUSER_ROOT_ID, ".trackerignore") {
+                        child_inos.push(ino);
+                    }
+                    if let Some(ino) = table.get_child_ino(FUSER_ROOT_ID, ".nomedia") {
+                        child_inos.push(ino);
+                    }
+                }
 
                 for file in &files {
                     let ino = table.insert_or_update(parent_ino, file);
@@ -484,7 +585,23 @@ impl Filesystem for GoogleDriveFS {
         let target_ino = if let Some(ino) = cached_ino {
             ino
         } else {
-            // 2. Not cached; fetch directory from Google Drive
+            // Fast negative lookup: if parent's children are already loaded,
+            // the requested file definitely does not exist! Do not call remote API.
+            let already_fetched = {
+                let table = self.inodes.read().unwrap();
+                table.has_children_cached(parent_ino)
+            };
+
+            if already_fetched {
+                debug!(
+                    "Fast negative lookup HIT: parent={}, name={}",
+                    parent_ino, name_str
+                );
+                reply.error(Errno::ENOENT);
+                return;
+            }
+
+            // 2. Not cached; fetch directory (checking SQLite first, then Drive API)
             let parent_drive_id = {
                 let table = self.inodes.read().unwrap();
                 table.get_by_ino(parent_ino).map(|e| e.drive_id)
@@ -682,34 +799,55 @@ impl Filesystem for GoogleDriveFS {
             let fh = self.alloc_fh();
             let staging_path = self.staging_path_for_fh(fh);
 
-            let client = self.client.clone();
             let drive_id = entry.drive_id.clone();
             let sp = staging_path.clone();
+            let is_trunc = (flags.0 & libc::O_TRUNC) != 0;
 
-            if entry.size > 0 {
-                let download_res = self
-                    .rt_handle
-                    .block_on(async move { client.download_file(&drive_id).await });
-                match download_res {
-                    Ok(bytes) => {
-                        if let Err(e) = fs::write(&sp, &bytes) {
-                            error!("Failed to stage file for writing: {}", e);
-                            reply.error(Errno::EIO);
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to download file for write-staging: {}", e);
-                        reply.error(Errno::EIO);
-                        return;
-                    }
-                }
-            } else {
-                // Empty file — just create an empty staging file
+            if is_trunc || entry.size == 0 {
+                // If truncated or empty, avoid downloading the old file!
                 if let Err(e) = fs::write(&staging_path, b"") {
                     error!("Failed to create empty staging file: {}", e);
                     reply.error(Errno::EIO);
                     return;
+                }
+            } else {
+                // Check if already in local chunk cache
+                let local_chunk = if let Some(ref arc_cache) = self.cache {
+                    arc_cache
+                        .lock()
+                        .ok()
+                        .and_then(|c| c.load_chunk(&drive_id).ok().flatten())
+                } else {
+                    None
+                };
+
+                if let Some(bytes) = local_chunk {
+                    debug!("Staging from local chunk cache for ino={}", ino_val);
+                    if let Err(e) = fs::write(&sp, &bytes) {
+                        error!("Failed to stage cached file for writing: {}", e);
+                        reply.error(Errno::EIO);
+                        return;
+                    }
+                } else {
+                    let client = self.client.clone();
+                    let did = drive_id.clone();
+                    let download_res = self
+                        .rt_handle
+                        .block_on(async move { client.download_file(&did).await });
+                    match download_res {
+                        Ok(bytes) => {
+                            if let Err(e) = fs::write(&sp, &bytes) {
+                                error!("Failed to stage file for writing: {}", e);
+                                reply.error(Errno::EIO);
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to download file for write-staging: {}", e);
+                            reply.error(Errno::EIO);
+                            return;
+                        }
+                    }
                 }
             }
 
@@ -788,6 +926,12 @@ impl Filesystem for GoogleDriveFS {
             }
         };
 
+        // Virtual control files (.trackerignore, .nomedia) return empty content
+        if entry.drive_id.starts_with("virtual_") {
+            reply.data(&[]);
+            return;
+        }
+
         if offset >= entry.size {
             reply.data(&[]);
             return;
@@ -845,52 +989,66 @@ impl Filesystem for GoogleDriveFS {
         // --- Drive API fallback ---
         let client = self.client.clone();
         let did = drive_id.clone();
+        const CACHE_THRESHOLD: u64 = 16 * 1024 * 1024;
 
+        // If file is small enough (<= 16 MB), download and cache the entire file once!
+        // This makes all subsequent sequential chunk reads (e.g. 80 chunks) instant local cache hits.
+        if entry.size > 0 && entry.size <= CACHE_THRESHOLD {
+            let client_for_full = self.client.clone();
+            let did_clone = did.clone();
+            let full_res = self
+                .rt_handle
+                .block_on(async move { client_for_full.download_file(&did_clone).await });
+
+            if let Ok(full_data) = full_res {
+                if let Some(ref arc_cache) = self.cache {
+                    if let Ok(cache) = arc_cache.lock() {
+                        if let Ok(path) = cache.save_chunk(&did, &full_data) {
+                            let mut rec = CachedFileRecord {
+                                drive_id: did.clone(),
+                                parent_id: None,
+                                name: entry.name.clone(),
+                                mime_type: entry.mime_type.clone(),
+                                size: entry.size,
+                                modified_time: String::new(),
+                                etag: None,
+                                local_cache_path: Some(path.to_string_lossy().to_string()),
+                                sync_status: FileSyncStatus::Cached,
+                                last_accessed: CachedFileRecord::now_epoch(),
+                            };
+                            if let Ok(Some(existing)) = cache.get_file_record(&did) {
+                                rec.parent_id = existing.parent_id;
+                                rec.modified_time = existing.modified_time;
+                                rec.etag = existing.etag;
+                                rec.name = existing.name;
+                            }
+                            let _ = cache.upsert_file_record(&rec);
+                            debug!(
+                                "Cached full file ({} bytes) for drive_id={}",
+                                full_data.len(),
+                                did
+                            );
+                        }
+                    }
+                }
+                let start = offset as usize;
+                let end = (start + read_len as usize).min(full_data.len());
+                if start < full_data.len() {
+                    reply.data(&full_data[start..end]);
+                } else {
+                    reply.data(&[]);
+                }
+                return;
+            }
+        }
+
+        // For large files (> 16 MB) or if full download failed: range request
         let chunk_res = self
             .rt_handle
             .block_on(async move { client.download_file_range(&did, offset, read_len).await });
 
         match chunk_res {
             Ok(data) => {
-                debug!("FUSE read success: returned {} bytes from Drive", data.len());
-
-                // Opportunistically cache the file if this is a full read from offset 0
-                // and the file is small enough (≤ 16 MB) to store entirely.
-                const CACHE_THRESHOLD: u64 = 16 * 1024 * 1024;
-                if offset == 0 && entry.size > 0 && entry.size <= CACHE_THRESHOLD {
-                    if let Some(ref arc_cache) = self.cache {
-                        if let Ok(cache) = arc_cache.lock() {
-                            if let Ok(path) = cache.save_chunk(&drive_id, &data) {
-                                let mut rec = CachedFileRecord {
-                                    drive_id: drive_id.clone(),
-                                    parent_id: None,
-                                    name: entry.name.clone(),
-                                    mime_type: entry.mime_type.clone(),
-                                    size: entry.size,
-                                    modified_time: String::new(),
-                                    etag: None,
-                                    local_cache_path: Some(
-                                        path.to_string_lossy().to_string(),
-                                    ),
-                                    sync_status: FileSyncStatus::Cached,
-                                    last_accessed: CachedFileRecord::now_epoch(),
-                                };
-                                // Preserve existing metadata if already in cache.
-                                if let Ok(Some(existing)) =
-                                    cache.get_file_record(&drive_id)
-                                {
-                                    rec.parent_id = existing.parent_id;
-                                    rec.modified_time = existing.modified_time;
-                                    rec.etag = existing.etag;
-                                    rec.name = existing.name;
-                                }
-                                let _ = cache.upsert_file_record(&rec);
-                                debug!("Cached {} bytes for drive_id={}", data.len(), drive_id);
-                            }
-                        }
-                    }
-                }
-
                 reply.data(&data);
             }
             Err(e) => {
@@ -1211,51 +1369,73 @@ impl Filesystem for GoogleDriveFS {
             let client = self.client.clone();
             let did = drive_id.clone();
 
-            let upload_res = self
-                .rt_handle
-                .block_on(async move { client.update_file_content(&did, content, None).await });
+            // Update local inode size immediately
+            {
+                let mut table = self.inodes.write().unwrap();
+                table.update_size(ino_val, content_len);
+            }
 
-            // Clean up staging file regardless of upload result
+            // Save chunk locally in cache immediately so subsequent reads hit local SSD/RAM
+            if let Some(ref arc_cache) = self.cache {
+                if let Ok(cache) = arc_cache.lock() {
+                    let _ = cache.save_chunk(&drive_id, &content);
+                    if let Ok(Some(mut rec)) = cache.get_file_record(&drive_id) {
+                        rec.size = content_len;
+                        rec.sync_status = FileSyncStatus::Uploading;
+                        rec.last_accessed = CachedFileRecord::now_epoch();
+                        let _ = cache.upsert_file_record(&rec);
+                    }
+                }
+            }
+
+            // Clean up staging file
             let _ = fs::remove_file(&stage.staging_path);
 
-            match upload_res {
-                Ok(updated_file) => {
-                    // Update inode with authoritative size from Drive
-                    let authoritative_size = updated_file.size_bytes();
-                    let final_size = if authoritative_size > 0 {
-                        authoritative_size
-                    } else {
-                        content_len
-                    };
-                    let mut table = self.inodes.write().unwrap();
-                    table.update_size(ino_val, final_size);
-
-                    // Evict any stale cached chunk — content has changed on Drive.
-                    if let Some(ref arc_cache) = self.cache {
-                        if let Ok(cache) = arc_cache.lock() {
-                            let _ = cache.delete_chunk(&drive_id);
-                            // Update sync_status back to MetadataOnly.
-                            if let Ok(Some(mut rec)) = cache.get_file_record(&drive_id) {
-                                rec.sync_status = FileSyncStatus::MetadataOnly;
-                                rec.local_cache_path = None;
-                                rec.size = final_size;
-                                rec.last_accessed = CachedFileRecord::now_epoch();
-                                let _ = cache.upsert_file_record(&rec);
+            // Spawn background upload onto Tokio runtime without blocking the FUSE thread!
+            let cache_clone = self.cache.clone();
+            let inodes_clone = self.inodes.clone();
+            self.rt_handle.spawn(async move {
+                match client.update_file_content(&did, content, None).await {
+                    Ok(updated_file) => {
+                        let authoritative_size = updated_file.size_bytes();
+                        let final_size = if authoritative_size > 0 {
+                            authoritative_size
+                        } else {
+                            content_len
+                        };
+                        if let Ok(mut table) = inodes_clone.write() {
+                            table.update_size(ino_val, final_size);
+                        }
+                        if let Some(ref arc_cache) = cache_clone {
+                            if let Ok(cache) = arc_cache.lock() {
+                                if let Ok(Some(mut rec)) = cache.get_file_record(&did) {
+                                    rec.sync_status = FileSyncStatus::Cached;
+                                    rec.size = final_size;
+                                    rec.last_accessed = CachedFileRecord::now_epoch();
+                                    let _ = cache.upsert_file_record(&rec);
+                                }
+                            }
+                        }
+                        info!(
+                            "Background upload complete for ino={} drive_id={} ({} bytes)",
+                            ino_val, did, final_size
+                        );
+                    }
+                    Err(e) => {
+                        error!("Background upload failed for {}: {}", did, e);
+                        if let Some(ref arc_cache) = cache_clone {
+                            if let Ok(cache) = arc_cache.lock() {
+                                if let Ok(Some(mut rec)) = cache.get_file_record(&did) {
+                                    rec.sync_status = FileSyncStatus::ModifiedLocally;
+                                    let _ = cache.upsert_file_record(&rec);
+                                }
                             }
                         }
                     }
+                }
+            });
 
-                    info!(
-                        "Uploaded staged content for ino={} drive_id={} ({} bytes)",
-                        ino_val, drive_id, final_size
-                    );
-                    reply.ok();
-                }
-                Err(e) => {
-                    error!("Failed to upload staged content for {}: {}", drive_id, e);
-                    reply.error(Errno::EIO);
-                }
-            }
+            reply.ok();
         } else {
             reply.ok();
         }
@@ -1792,5 +1972,30 @@ mod tests {
         let path = default_staging_dir();
         assert!(path.to_string_lossy().contains("google-drive-linux"));
         assert!(path.to_string_lossy().contains("staging"));
+    }
+
+    #[test]
+    fn test_virtual_trackerignore_and_nomedia() {
+        let table = InodeTable::new();
+        let tracker_ino = table.get_child_ino(FUSER_ROOT_ID, ".trackerignore");
+        assert_eq!(tracker_ino, Some(2));
+        let tracker_entry = table.get_by_ino(2).expect("tracker entry");
+        assert_eq!(tracker_entry.name, ".trackerignore");
+        assert_eq!(tracker_entry.size, 0);
+
+        let nomedia_ino = table.get_child_ino(FUSER_ROOT_ID, ".nomedia");
+        assert_eq!(nomedia_ino, Some(3));
+        let nomedia_entry = table.get_by_ino(3).expect("nomedia entry");
+        assert_eq!(nomedia_entry.name, ".nomedia");
+        assert_eq!(nomedia_entry.size, 0);
+    }
+
+    #[test]
+    fn test_has_children_cached() {
+        let mut table = InodeTable::new();
+        assert!(!table.has_children_cached(FUSER_ROOT_ID));
+
+        table.set_children(FUSER_ROOT_ID, vec![2, 3]);
+        assert!(table.has_children_cached(FUSER_ROOT_ID));
     }
 }

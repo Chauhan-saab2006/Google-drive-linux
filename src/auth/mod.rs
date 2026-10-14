@@ -230,14 +230,17 @@ pub struct GoogleOAuthClient {
     config: OAuthConfig,
     http: Client,
     token_store: TokenStore,
+    cached_creds: std::sync::RwLock<Option<StoredCredentials>>,
 }
 
 impl GoogleOAuthClient {
     pub fn new(config: OAuthConfig, token_store: TokenStore) -> Self {
+        let initial_creds = token_store.load().ok().flatten();
         Self {
             config,
             http: Client::new(),
             token_store,
+            cached_creds: std::sync::RwLock::new(initial_creds),
         }
     }
 
@@ -247,8 +250,16 @@ impl GoogleOAuthClient {
 
     /// Return current authentication state.
     pub fn current_state(&self) -> AuthState {
-        match self.token_store.load() {
-            Ok(Some(creds)) => {
+        let creds_opt = if let Ok(guard) = self.cached_creds.read() {
+            guard
+                .clone()
+                .or_else(|| self.token_store.load().ok().flatten())
+        } else {
+            self.token_store.load().ok().flatten()
+        };
+
+        match creds_opt {
+            Some(creds) => {
                 if creds.is_expired() && creds.refresh_token.is_empty() {
                     AuthState::Expired
                 } else {
@@ -262,13 +273,22 @@ impl GoogleOAuthClient {
                     })
                 }
             }
-            Ok(None) => AuthState::Unauthenticated,
-            Err(e) => AuthState::Error(e.to_string()),
+            None => AuthState::Unauthenticated,
         }
     }
 
     /// Retrieve a valid access token, automatically refreshing if expired or expiring soon.
     pub async fn get_valid_access_token(&self) -> Result<String, AuthError> {
+        // Fast path: check in-memory cache without hitting disk
+        if let Ok(guard) = self.cached_creds.read() {
+            if let Some(ref creds) = *guard {
+                if !creds.needs_refresh() {
+                    return Ok(creds.access_token.clone());
+                }
+            }
+        }
+
+        // Slow path: load or refresh from token store
         let mut creds = self
             .token_store
             .load()?
@@ -280,7 +300,12 @@ impl GoogleOAuthClient {
             self.token_store.save(&creds)?;
         }
 
-        Ok(creds.access_token)
+        let token = creds.access_token.clone();
+        if let Ok(mut guard) = self.cached_creds.write() {
+            *guard = Some(creds);
+        }
+
+        Ok(token)
     }
 
     /// Execute the full OAuth 2.0 PKCE browser authorization flow with loopback listener.
@@ -410,6 +435,9 @@ impl GoogleOAuthClient {
 
         // Save credentials to secure disk store
         self.token_store.save(&creds)?;
+        if let Ok(mut guard) = self.cached_creds.write() {
+            *guard = Some(creds.clone());
+        }
         info!("OAuth credentials saved successfully.");
 
         Ok(creds)
@@ -556,6 +584,9 @@ impl GoogleOAuthClient {
         }
 
         self.token_store.clear()?;
+        if let Ok(mut guard) = self.cached_creds.write() {
+            *guard = None;
+        }
         info!("Logged out and cleared stored credentials.");
         Ok(())
     }

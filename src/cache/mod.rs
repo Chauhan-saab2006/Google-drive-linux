@@ -158,6 +158,8 @@ pub struct MetadataCache {
     pub chunk_dir: PathBuf,
     /// Maximum total size of cached chunks in bytes.
     pub max_cache_bytes: u64,
+    /// Track current chunk cache bytes to avoid recursive disk walks on every chunk write.
+    pub current_cache_bytes: std::sync::atomic::AtomicU64,
 }
 
 impl MetadataCache {
@@ -177,10 +179,12 @@ impl MetadataCache {
              PRAGMA cache_size   = -8000;", // 8 MB page cache
         )?;
 
+        let initial_bytes = dir_size_bytes(chunk_dir);
         let cache = Self {
             conn: Mutex::new(conn),
             chunk_dir: chunk_dir.to_path_buf(),
             max_cache_bytes: max_cache_mb * 1024 * 1024,
+            current_cache_bytes: std::sync::atomic::AtomicU64::new(initial_bytes),
         };
         cache.init_schema()?;
         info!("MetadataCache opened at {:?}", db_path);
@@ -237,8 +241,21 @@ impl MetadataCache {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        let old_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         fs::write(&path, data)?;
-        debug!("Saved chunk for drive_id={} ({} bytes)", drive_id, data.len());
+        let new_size = data.len() as u64;
+        if new_size > old_size {
+            self.current_cache_bytes
+                .fetch_add(new_size - old_size, std::sync::atomic::Ordering::Relaxed);
+        } else if old_size > new_size {
+            self.current_cache_bytes
+                .fetch_sub(old_size - new_size, std::sync::atomic::Ordering::Relaxed);
+        }
+        debug!(
+            "Saved chunk for drive_id={} ({} bytes)",
+            drive_id,
+            data.len()
+        );
         self.maybe_evict()?;
         Ok(path)
     }
@@ -257,14 +274,19 @@ impl MetadataCache {
     pub fn delete_chunk(&self, drive_id: &str) -> Result<(), CacheError> {
         let path = self.chunk_path(drive_id);
         if path.exists() {
+            if let Ok(meta) = fs::metadata(&path) {
+                self.current_cache_bytes
+                    .fetch_sub(meta.len(), std::sync::atomic::Ordering::Relaxed);
+            }
             fs::remove_file(&path)?;
         }
         Ok(())
     }
 
-    /// Return total bytes used by the chunk cache directory.
+    /// Return total bytes used by the chunk cache directory (fast atomic lookup).
     pub fn chunk_cache_bytes(&self) -> u64 {
-        dir_size_bytes(&self.chunk_dir)
+        self.current_cache_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Evict the least-recently-accessed cached chunks until usage drops below
@@ -308,6 +330,8 @@ impl MetadataCache {
                     continue;
                 }
                 remaining = remaining.saturating_sub(file_size);
+                self.current_cache_bytes
+                    .fetch_sub(file_size, std::sync::atomic::Ordering::Relaxed);
                 // Update sync_status back to MetadataOnly
                 conn.execute(
                     "UPDATE file_metadata
@@ -637,10 +661,7 @@ mod tests {
             .expect("upsert");
         cache.delete_file_record("del_me").expect("delete");
 
-        assert!(cache
-            .get_file_record("del_me")
-            .expect("get")
-            .is_none());
+        assert!(cache.get_file_record("del_me").expect("get").is_none());
     }
 
     #[test]
@@ -658,9 +679,7 @@ mod tests {
             .upsert_file_record(&sample_record("child_c", Some("folder_2")))
             .expect("upsert c");
 
-        let children = cache
-            .get_children(Some("folder_1"))
-            .expect("children");
+        let children = cache.get_children(Some("folder_1")).expect("children");
         assert_eq!(children.len(), 2);
         let ids: Vec<&str> = children.iter().map(|r| r.drive_id.as_str()).collect();
         assert!(ids.contains(&"child_a"));
@@ -698,9 +717,7 @@ mod tests {
 
         assert!(cache.load_page_token().expect("load").is_none());
 
-        cache
-            .save_page_token("token_abc123")
-            .expect("save token");
+        cache.save_page_token("token_abc123").expect("save token");
         let loaded = cache.load_page_token().expect("load").expect("must exist");
         assert_eq!(loaded, "token_abc123");
 
@@ -742,12 +759,7 @@ mod tests {
         // Upsert a record that claims to be cached
         let mut rec = sample_record("evict_me", Some("root"));
         rec.sync_status = FileSyncStatus::Cached;
-        rec.local_cache_path = Some(
-            cache
-                .chunk_path("evict_me")
-                .to_string_lossy()
-                .to_string(),
-        );
+        rec.local_cache_path = Some(cache.chunk_path("evict_me").to_string_lossy().to_string());
         cache.upsert_file_record(&rec).expect("upsert");
 
         // Save a chunk (which triggers eviction)

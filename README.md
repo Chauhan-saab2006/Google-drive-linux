@@ -66,39 +66,58 @@ Linux File Managers (Nautilus, Dolphin, Thunar) & Native Apps
 
 ---
 
+## Download & Install App Packages
+
+Pre-built application packages for laptop & desktop installation are available in the [`dist/`](dist/) folder:
+
+| Distribution | Package | How to Install |
+|---|---|---|
+| **Any Linux (Universal)** | [`dist/google-drive-linux-0.1.0-linux-x86_64.tar.gz`](dist/google-drive-linux-0.1.0-linux-x86_64.tar.gz) | `tar -xzf <file> && cd google-drive-linux-0.1.0-x86_64 && ./install.sh` |
+| **Arch / CachyOS / Manjaro** | [`dist/google-drive-linux-bin-0.1.0-1-x86_64.pkg.tar.zst`](dist/google-drive-linux-bin-0.1.0-1-x86_64.pkg.tar.zst) | `sudo pacman -U <file>` |
+| **Ubuntu / Debian / Mint** | [`dist/google-drive-linux_0.1.0_amd64.deb`](dist/google-drive-linux_0.1.0_amd64.deb) | `sudo apt install ./<file>` |
+
+---
+
 ## Quick Start
 
 ### 1. Build & Test
 ```bash
-cargo build
+cargo build --release
 cargo test
 ```
 
-### 2. Configure OAuth Credentials (Interactive Wizard)
+### 2. Generate Application Packages
 ```bash
-./scripts/setup-oauth.sh ./target/debug/google-drive-linux
+./scripts/package.sh
+```
+Builds the release binary and outputs the Universal Tarball, Arch `.pkg.tar.zst`, and Debian `.deb` packages in `dist/`.
+
+### 3. Configure OAuth Credentials (Interactive Wizard)
+```bash
+./scripts/setup-oauth.sh ./target/release/google-drive-linux
 ```
 
-### 3. Install Desktop Integration & Launcher
+### 4. Install Desktop Integration & Launcher
 ```bash
 ./scripts/install-desktop.sh
 ```
-This installs the binary to `~/.local/bin`, the desktop launcher to `~/.local/share/applications`, and the SVG icon to your desktop icon theme.
+This installs the binary to `~/.local/bin`, the desktop launcher to `~/.local/share/applications`, and the SVG icon to your desktop icon theme so Google Drive appears in your application menu.
 
-### 4. Enable Background Auto-Mount Daemon (Systemd)
+### 5. Enable Background Auto-Mount Daemon (Systemd)
 ```bash
 ./scripts/install-service.sh
 ```
 
-### 5. CLI Commands
+### 6. CLI Commands
 ```bash
-google-drive-linux status           # View account, token, quota, and mount status
-google-drive-linux mount            # Mount Google Drive to ~/GoogleDrive
-google-drive-linux unmount          # Unmount Google Drive
-google-drive-linux list             # List files in Google Drive root
-google-drive-linux sync             # Manually trigger offline flush & remote change poll
-google-drive-linux daemon           # Run daemon in foreground
-google-drive-linux                  # Launch Libadwaita desktop GUI (default)
+google-drive-linux status                                 # View account, token, quota, and mount status
+google-drive-linux mount                                  # Mount Google Drive to default mountpoint (~/GoogleDrive)
+google-drive-linux mount --mountpoint ~/MyCustomDrive     # Mount to custom directory (or -t / --target)
+google-drive-linux unmount --mountpoint ~/GoogleDrive     # Unmount Google Drive
+google-drive-linux list                                   # List files in Google Drive root
+google-drive-linux sync                                   # Manually trigger offline flush & remote change poll
+google-drive-linux daemon                                 # Run daemon in foreground
+google-drive-linux                                        # Launch Libadwaita desktop GUI (default)
 ```
 
 ---

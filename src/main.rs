@@ -58,13 +58,13 @@ enum Commands {
     /// Mount Google Drive to the configured mount point
     Mount {
         /// Optional mount directory override
-        #[arg(short, long)]
+        #[arg(short, long, visible_alias = "mountpoint")]
         target: Option<PathBuf>,
     },
     /// Unmount Google Drive
     Unmount {
         /// Optional mount directory override
-        #[arg(short, long)]
+        #[arg(short, long, visible_alias = "mountpoint")]
         target: Option<PathBuf>,
     },
     /// Display current account, authentication, mount, and sync status
@@ -224,7 +224,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Some(std::sync::Arc::new(std::sync::Mutex::new(c)))
                 }
                 Err(e) => {
-                    eprintln!("Warning: failed to open metadata cache: {e}. Running without cache.");
+                    eprintln!(
+                        "Warning: failed to open metadata cache: {e}. Running without cache."
+                    );
                     None
                 }
             };
@@ -399,7 +401,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 auth::OAuthConfig::default(),
                 token_store,
             ));
-            let drive_client = std::sync::Arc::new(drive::GoogleDriveClient::new(None, None, oauth));
+            let drive_client =
+                std::sync::Arc::new(drive::GoogleDriveClient::new(None, None, oauth));
             let meta_cache = cache::open_default_cache(config.cache_size_mb)
                 .ok()
                 .map(|c| std::sync::Arc::new(std::sync::Mutex::new(c)));
@@ -416,9 +419,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             println!("Synchronizing with Google Drive...");
-            let flushed = sync_engine.flush_offline_queue().await.map_err(|e| anyhow::anyhow!(e))?;
+            let flushed = sync_engine
+                .flush_offline_queue()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
             println!("Flushed {flushed} offline write(s).");
-            let polled = sync_engine.poll_remote_changes().await.map_err(|e| anyhow::anyhow!(e))?;
+            let polled = sync_engine
+                .poll_remote_changes()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
             println!("Polled {polled} remote change(s).");
             println!("Sync complete.");
         }

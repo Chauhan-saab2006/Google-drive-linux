@@ -319,7 +319,7 @@ impl GoogleDriveClient {
 
         loop {
             let res = self
-                .list_files(Some(parent_id), page_token.as_deref(), Some(100))
+                .list_files(Some(parent_id), page_token.as_deref(), Some(1000))
                 .await?;
             all_files.extend(res.files);
 
@@ -775,10 +775,7 @@ impl GoogleDriveClient {
     }
 
     /// List changes from the Google Drive Changes API starting at `page_token`.
-    pub async fn list_changes(
-        &self,
-        page_token: &str,
-    ) -> Result<DriveChangesResponse, DriveError> {
+    pub async fn list_changes(&self, page_token: &str) -> Result<DriveChangesResponse, DriveError> {
         let url = format!("{}/drive/v3/changes", self.base_url);
         let fields = format!(
             "nextPageToken,newStartPageToken,changes(kind,changeType,fileId,removed,time,file({}))",
@@ -1153,7 +1150,10 @@ mod tests {
         let resp: DriveChangesResponse =
             serde_json::from_str(json_data).expect("Changes response should deserialize");
         assert_eq!(resp.next_page_token.as_deref(), Some("token_next_123"));
-        assert_eq!(resp.new_start_page_token.as_deref(), Some("token_start_456"));
+        assert_eq!(
+            resp.new_start_page_token.as_deref(),
+            Some("token_start_456")
+        );
         assert_eq!(resp.changes.len(), 2);
         assert_eq!(resp.changes[0].file_id.as_deref(), Some("file_remote_1"));
         assert!(!resp.changes[0].removed);
