@@ -195,7 +195,15 @@ impl GoogleDriveClient {
         Self {
             base_url: base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
             upload_base_url: upload_base_url.unwrap_or_else(|| DEFAULT_UPLOAD_URL.to_string()),
-            http: Client::new(),
+            http: Client::builder()
+                .pool_max_idle_per_host(4)
+                .pool_idle_timeout(Duration::from_secs(90))
+                .tcp_keepalive(Duration::from_secs(30))
+                .tcp_nodelay(true)
+                .timeout(Duration::from_secs(60))
+                .connect_timeout(Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
             oauth,
         }
     }

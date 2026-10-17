@@ -5,9 +5,10 @@ use std::time::Instant;
 use tokio::sync::watch;
 use tracing::{debug, warn};
 
-pub const STREAM_CHUNK_SIZE: u64 = 4 * 1024 * 1024; // 4 MB chunk size for high-speed streaming
-pub const MAX_CHUNKS_PER_STREAM: usize = 8; // 32 MB max in-memory window per stream
+pub const STREAM_CHUNK_SIZE: u64 = 8 * 1024 * 1024; // 8 MB chunk size — halves HTTP overhead vs 4 MB
+pub const MAX_CHUNKS_PER_STREAM: usize = 12; // 96 MB max in-memory window per stream
 pub const MAX_ACTIVE_STREAMS: usize = 16; // Up to 16 active concurrent streaming files
+const PREFETCH_AHEAD: u64 = 4; // Number of chunks to prefetch ahead of current read position
 
 #[derive(Clone)]
 enum ChunkSlot {
@@ -28,7 +29,9 @@ impl StreamFileState {
         }
     }
 
-    fn prune_lru(&mut self, max_chunks: usize) {
+    /// Evict chunks farthest from `current_chunk` first, preserving a backward
+    /// window for short seeks. Falls back to oldest-first as tiebreaker.
+    fn prune_lru(&mut self, max_chunks: usize, current_chunk: u64) {
         if self.slots.len() <= max_chunks {
             return;
         }
@@ -38,7 +41,14 @@ impl StreamFileState {
             .iter()
             .map(|(&idx, &(instant, _))| (idx, instant))
             .collect();
-        entries.sort_by_key(|&(_, instant)| instant);
+
+        // Primary: evict farthest chunks from current position (descending distance)
+        // Tiebreak: evict oldest chunks first (ascending timestamp)
+        entries.sort_by(|entry_a, entry_b| {
+            let dist_a = (entry_a.0 as i64 - current_chunk as i64).unsigned_abs();
+            let dist_b = (entry_b.0 as i64 - current_chunk as i64).unsigned_abs();
+            dist_b.cmp(&dist_a).then(entry_a.1.cmp(&entry_b.1))
+        });
 
         let to_remove = self.slots.len().saturating_sub(max_chunks);
         for (idx, _) in entries.into_iter().take(to_remove) {
@@ -148,24 +158,39 @@ impl StreamBufferManager {
             let valid_end = slice_end.min(chunk_data.len());
             let result = chunk_data[slice_start..valid_end].to_vec();
 
-            // Trigger background prefetch for next chunk if reader is past midway in this chunk
+            // Trigger background prefetch pipeline when reader passes midway through this chunk
             if (offset + actual_length) >= chunk_start_offset + (STREAM_CHUNK_SIZE / 2) {
-                let next_chunk = start_chunk + 1;
-                if next_chunk * STREAM_CHUNK_SIZE < file_size {
-                    self.trigger_prefetch(
-                        file_state,
-                        client.clone(),
-                        drive_id.to_string(),
-                        next_chunk,
-                        file_size,
-                        rt_handle,
-                    );
+                for i in 1..=PREFETCH_AHEAD {
+                    let future_chunk = start_chunk + i;
+                    if future_chunk * STREAM_CHUNK_SIZE < file_size {
+                        self.trigger_prefetch(
+                            file_state.clone(),
+                            client.clone(),
+                            drive_id.to_string(),
+                            future_chunk,
+                            file_size,
+                            rt_handle,
+                        );
+                    }
                 }
             }
 
             Ok(result)
         } else {
-            // Read spans across multiple chunks
+            // Read spans across multiple chunks — pre-trigger parallel downloads
+            // so all chunks begin downloading concurrently instead of sequentially
+            for chunk_idx in start_chunk..=end_chunk {
+                self.trigger_prefetch(
+                    file_state.clone(),
+                    client.clone(),
+                    drive_id.to_string(),
+                    chunk_idx,
+                    file_size,
+                    rt_handle,
+                );
+            }
+
+            // Collect results (downloads are already running in parallel via pre-trigger)
             let mut result = Vec::with_capacity(actual_length as usize);
             let mut current_offset = offset;
             let end_offset = offset + actual_length;
@@ -198,17 +223,19 @@ impl StreamBufferManager {
                 current_offset = read_end;
             }
 
-            // Trigger prefetch for the chunk immediately after end_chunk
-            let next_chunk = end_chunk + 1;
-            if next_chunk * STREAM_CHUNK_SIZE < file_size {
-                self.trigger_prefetch(
-                    file_state,
-                    client.clone(),
-                    drive_id.to_string(),
-                    next_chunk,
-                    file_size,
-                    rt_handle,
-                );
+            // Prefetch pipeline: queue chunks ahead of the read region
+            for i in 1..=PREFETCH_AHEAD {
+                let future_chunk = end_chunk + i;
+                if future_chunk * STREAM_CHUNK_SIZE < file_size {
+                    self.trigger_prefetch(
+                        file_state.clone(),
+                        client.clone(),
+                        drive_id.to_string(),
+                        future_chunk,
+                        file_size,
+                        rt_handle,
+                    );
+                }
             }
 
             Ok(result)
@@ -273,10 +300,11 @@ impl StreamBufferManager {
                         let _ = tx.send(Some(arc_data.clone()));
 
                         let mut state = file_state.lock().unwrap();
-                        state
-                            .slots
-                            .insert(chunk_idx, (Instant::now(), ChunkSlot::Ready(arc_data.clone())));
-                        state.prune_lru(MAX_CHUNKS_PER_STREAM);
+                        state.slots.insert(
+                            chunk_idx,
+                            (Instant::now(), ChunkSlot::Ready(arc_data.clone())),
+                        );
+                        state.prune_lru(MAX_CHUNKS_PER_STREAM, chunk_idx);
                         Ok(arc_data)
                     }
                     Err(e) => {
@@ -321,7 +349,10 @@ impl StreamBufferManager {
         let did = drive_id.clone();
         rt_handle.spawn(async move {
             debug!("Prefetching chunk {} for {}", chunk_idx, did);
-            match client.download_file_range(&did, chunk_start, chunk_len).await {
+            match client
+                .download_file_range(&did, chunk_start, chunk_len)
+                .await
+            {
                 Ok(bytes) => {
                     let arc_data = Arc::new(bytes);
                     let _ = tx.send(Some(arc_data.clone()));
@@ -329,7 +360,7 @@ impl StreamBufferManager {
                     state
                         .slots
                         .insert(chunk_idx, (Instant::now(), ChunkSlot::Ready(arc_data)));
-                    state.prune_lru(MAX_CHUNKS_PER_STREAM);
+                    state.prune_lru(MAX_CHUNKS_PER_STREAM, chunk_idx);
                 }
                 Err(e) => {
                     warn!(
@@ -362,16 +393,22 @@ mod tests {
     #[test]
     fn test_stream_file_state_lru() {
         let mut state = StreamFileState::new();
-        // Insert 10 chunks
+        // Insert 10 chunks (0..10)
         for i in 0..10 {
             let data = Arc::new(vec![i as u8; 1024]);
-            state.slots.insert(i, (Instant::now(), ChunkSlot::Ready(data)));
+            state
+                .slots
+                .insert(i, (Instant::now(), ChunkSlot::Ready(data)));
         }
         assert_eq!(state.slots.len(), 10);
 
-        // Prune to 4 chunks
-        state.prune_lru(4);
+        // Prune to 4 chunks closest to current_chunk = 8
+        // Chunks closest to 8: 8, 7, 9, 6 (or similar distance <= 2)
+        state.prune_lru(4, 8);
         assert_eq!(state.slots.len(), 4);
+        assert!(state.slots.contains_key(&8));
+        assert!(state.slots.contains_key(&7));
+        assert!(state.slots.contains_key(&9));
     }
 
     #[test]
@@ -477,7 +514,14 @@ mod tests {
         // 3. Read spanning across the 4 MB boundary: 4MB - 100 bytes to 4MB + 100 bytes (200 bytes total)
         let span_offset = STREAM_CHUNK_SIZE - 100;
         let span_data = manager
-            .read_range(&client, "stream_doc_1", mock_file_size, span_offset, 200, &rt)
+            .read_range(
+                &client,
+                "stream_doc_1",
+                mock_file_size,
+                span_offset,
+                200,
+                &rt,
+            )
             .await
             .expect("read spanning data");
         assert_eq!(span_data.len(), 200);
@@ -487,4 +531,3 @@ mod tests {
         }
     }
 }
-

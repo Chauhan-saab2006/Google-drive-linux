@@ -224,10 +224,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .or_else(|| std::env::var("GOOGLE_CLIENT_SECRET").ok()),
                 ..auth::OAuthConfig::default()
             };
-            let oauth = std::sync::Arc::new(auth::GoogleOAuthClient::new(
-                oauth_cfg,
-                token_store,
-            ));
+            let oauth = std::sync::Arc::new(auth::GoogleOAuthClient::new(oauth_cfg, token_store));
             let drive_client =
                 std::sync::Arc::new(drive::GoogleDriveClient::new(None, None, oauth));
 

@@ -459,7 +459,11 @@ impl GoogleDriveFS {
         self.inodes.clone()
     }
 
-    fn load_cached_children(&self, parent_ino: u64, parent_drive_id: &str) -> Option<Vec<InodeEntry>> {
+    fn load_cached_children(
+        &self,
+        parent_ino: u64,
+        parent_drive_id: &str,
+    ) -> Option<Vec<InodeEntry>> {
         let arc_cache = self.cache.as_ref()?;
         let cache = arc_cache.lock().ok()?;
         let cached_files = cache.get_children(Some(parent_drive_id)).ok()?;
@@ -615,9 +619,10 @@ impl GoogleDriveFS {
 impl Filesystem for GoogleDriveFS {
     fn init(&mut self, _req: &Request, config: &mut fuser::KernelConfig) -> std::io::Result<()> {
         info!("Google Drive FUSE filesystem initialized (read-write mode).");
-        let _ = config.set_max_readahead(1024 * 1024); // 1 MB kernel read-ahead for high streaming throughput
-        let _ = config.set_max_background(64);
-        let _ = config.set_congestion_threshold(48);
+        let _ = config.set_max_readahead(8 * 1024 * 1024); // 8 MB kernel read-ahead for smooth video streaming
+        let _ = config.set_max_background(128); // Allow more concurrent background FUSE requests
+        let _ = config.set_congestion_threshold(96); // Higher threshold before kernel starts throttling
+        let _ = config.set_max_write(1024 * 1024); // 1 MB write buffer
         Ok(())
     }
 
@@ -1800,8 +1805,8 @@ pub fn mount_filesystem(
     ];
 
     let n_threads = std::thread::available_parallelism()
-        .map(|n| n.get().clamp(4, 16))
-        .unwrap_or(4);
+        .map(|n| n.get().clamp(8, 32))
+        .unwrap_or(8);
     config.n_threads = Some(n_threads);
     config.clone_fd = true;
 

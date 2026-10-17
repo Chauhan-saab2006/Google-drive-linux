@@ -549,7 +549,8 @@ impl GoogleOAuthClient {
 
         if cid.trim().is_empty() {
             return Err(AuthError::Config(
-                "Google Client ID is missing. Cannot refresh access token without client_id.".to_string(),
+                "Google Client ID is missing. Cannot refresh access token without client_id."
+                    .to_string(),
             ));
         }
 
@@ -796,7 +797,9 @@ mod tests {
                 let n = socket.read(&mut buf).await.unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]);
 
-                if req.contains("grant_type=refresh_token") && req.contains("client_id=stored_client_xyz") {
+                if req.contains("grant_type=refresh_token")
+                    && req.contains("client_id=stored_client_xyz")
+                {
                     let body = r#"{"access_token":"refreshed_from_stored_id","expires_in":3600,"token_type":"Bearer"}"#;
                     let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
                     let _ = socket.write_all(resp.as_bytes()).await;

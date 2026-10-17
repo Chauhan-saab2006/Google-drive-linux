@@ -191,9 +191,7 @@ fn build_ui(app: &adw::Application, config: &AppConfig) {
         .or_else(|| std::env::var("GOOGLE_CLIENT_SECRET").ok())
         .unwrap_or_default();
 
-    let client_id_row = adw::EntryRow::builder()
-        .title("OAuth Client ID")
-        .build();
+    let client_id_row = adw::EntryRow::builder().title("OAuth Client ID").build();
     if !initial_client_id.is_empty() {
         client_id_row.set_text(&initial_client_id);
     }
@@ -260,15 +258,24 @@ fn build_ui(app: &adw::Application, config: &AppConfig) {
         let csecret = client_secret_entry_clone.text().trim().to_string();
 
         let mut conf = config_save_ref.borrow_mut();
-        conf.client_id = if cid.is_empty() { None } else { Some(cid.clone()) };
-        conf.client_secret = if csecret.is_empty() { None } else { Some(csecret) };
+        conf.client_id = if cid.is_empty() {
+            None
+        } else {
+            Some(cid.clone())
+        };
+        conf.client_secret = if csecret.is_empty() {
+            None
+        } else {
+            Some(csecret)
+        };
 
         match conf.save() {
             Ok(()) => {
                 save_creds_row_clone.set_subtitle("✓ Credentials saved to config.toml");
                 btn.set_label("Saved");
                 if !cid.is_empty() {
-                    account_row_for_save.set_subtitle("Credentials configured. Click 'Sign in with Google' above.");
+                    account_row_for_save
+                        .set_subtitle("Credentials configured. Click 'Sign in with Google' above.");
                 }
                 let b = btn.clone();
                 glib::timeout_add_local_once(std::time::Duration::from_secs(2), move || {
@@ -332,7 +339,9 @@ fn build_ui(app: &adw::Application, config: &AppConfig) {
                 };
 
                 if cid.trim().is_empty() {
-                    account_row_clone.set_subtitle("Please enter your Client ID in the Google Cloud Credentials section below");
+                    account_row_clone.set_subtitle(
+                        "Please enter your Client ID in the Google Cloud Credentials section below",
+                    );
                     return;
                 }
 
