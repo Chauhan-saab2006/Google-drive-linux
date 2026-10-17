@@ -201,7 +201,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 AppConfig::default_credentials_path().map_err(|e| anyhow::anyhow!(e))?;
             let token_store = auth::TokenStore::new(creds_path);
             let creds = match token_store.load() {
-                Ok(Some(c)) if !c.is_expired() => c,
+                Ok(Some(c)) if !c.is_expired() || !c.refresh_token.is_empty() => c,
                 _ => {
                     eprintln!("Error: Authentication required before mounting Google Drive.");
                     eprintln!("\nPlease sign in with your Google account:");
@@ -210,8 +210,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
+            let oauth_cfg = auth::OAuthConfig {
+                client_id: config
+                    .client_id
+                    .clone()
+                    .or_else(|| creds.client_id.clone())
+                    .or_else(|| std::env::var("GOOGLE_CLIENT_ID").ok())
+                    .unwrap_or_default(),
+                client_secret: config
+                    .client_secret
+                    .clone()
+                    .or_else(|| creds.client_secret.clone())
+                    .or_else(|| std::env::var("GOOGLE_CLIENT_SECRET").ok()),
+                ..auth::OAuthConfig::default()
+            };
             let oauth = std::sync::Arc::new(auth::GoogleOAuthClient::new(
-                auth::OAuthConfig::default(),
+                oauth_cfg,
                 token_store,
             ));
             let drive_client =

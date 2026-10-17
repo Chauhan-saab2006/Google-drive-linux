@@ -159,13 +159,129 @@ fn build_ui(app: &adw::Application, config: &AppConfig) {
     settings_group.add(&auto_mount_row);
     preferences_page.add(&settings_group);
 
-    // Wire auth button click
-    let config_ref = Rc::new(config.clone());
+    // 5. Google Cloud OAuth Credentials Section
+    let oauth_group = adw::PreferencesGroup::builder()
+        .title("Google Cloud OAuth Credentials")
+        .description("Enter your Client ID and Client Secret from Google Cloud Console")
+        .build();
+
+    let initial_client_id = config
+        .client_id
+        .clone()
+        .or_else(|| {
+            AppConfig::default_credentials_path()
+                .ok()
+                .map(TokenStore::new)
+                .and_then(|s| s.load().ok().flatten())
+                .and_then(|c| c.client_id)
+        })
+        .or_else(|| std::env::var("GOOGLE_CLIENT_ID").ok())
+        .unwrap_or_default();
+
+    let initial_client_secret = config
+        .client_secret
+        .clone()
+        .or_else(|| {
+            AppConfig::default_credentials_path()
+                .ok()
+                .map(TokenStore::new)
+                .and_then(|s| s.load().ok().flatten())
+                .and_then(|c| c.client_secret)
+        })
+        .or_else(|| std::env::var("GOOGLE_CLIENT_SECRET").ok())
+        .unwrap_or_default();
+
+    let client_id_row = adw::EntryRow::builder()
+        .title("OAuth Client ID")
+        .build();
+    if !initial_client_id.is_empty() {
+        client_id_row.set_text(&initial_client_id);
+    }
+
+    let client_secret_row = adw::PasswordEntryRow::builder()
+        .title("OAuth Client Secret (Optional)")
+        .build();
+    if !initial_client_secret.is_empty() {
+        client_secret_row.set_text(&initial_client_secret);
+    }
+
+    let save_creds_row = adw::ActionRow::builder()
+        .title("Save Credentials")
+        .subtitle("Save keys to ~/.config/google-drive-linux/config.toml")
+        .build();
+
+    let save_creds_btn = gtk4::Button::builder()
+        .label("Save")
+        .valign(gtk4::Align::Center)
+        .build();
+    save_creds_btn.add_css_class("suggested-action");
+    save_creds_row.add_suffix(&save_creds_btn);
+
+    oauth_group.add(&client_id_row);
+    oauth_group.add(&client_secret_row);
+    oauth_group.add(&save_creds_row);
+    preferences_page.add(&oauth_group);
+
+    // Shared mutable configuration state
+    let config_ref = Rc::new(std::cell::RefCell::new(config.clone()));
     let config_auth_ref = config_ref.clone();
     let account_row_clone = account_row.clone();
     let auth_btn_clone = auth_btn.clone();
     let status_row_clone = status_row.clone();
+    let client_id_row_for_auth = client_id_row.clone();
+    let client_secret_row_for_auth = client_secret_row.clone();
 
+    // Wire toggle saving
+    let config_toggle1 = config_ref.clone();
+    auto_start_row.connect_active_notify(move |row| {
+        let is_active = row.is_active();
+        let mut conf = config_toggle1.borrow_mut();
+        conf.auto_start = is_active;
+        let _ = conf.save();
+    });
+
+    let config_toggle2 = config_ref.clone();
+    auto_mount_row.connect_active_notify(move |row| {
+        let is_active = row.is_active();
+        let mut conf = config_toggle2.borrow_mut();
+        conf.auto_mount = is_active;
+        let _ = conf.save();
+    });
+
+    // Wire save credentials button
+    let client_id_entry_clone = client_id_row.clone();
+    let client_secret_entry_clone = client_secret_row.clone();
+    let save_creds_row_clone = save_creds_row.clone();
+    let config_save_ref = config_ref.clone();
+    let account_row_for_save = account_row.clone();
+
+    save_creds_btn.connect_clicked(move |btn| {
+        let cid = client_id_entry_clone.text().trim().to_string();
+        let csecret = client_secret_entry_clone.text().trim().to_string();
+
+        let mut conf = config_save_ref.borrow_mut();
+        conf.client_id = if cid.is_empty() { None } else { Some(cid.clone()) };
+        conf.client_secret = if csecret.is_empty() { None } else { Some(csecret) };
+
+        match conf.save() {
+            Ok(()) => {
+                save_creds_row_clone.set_subtitle("✓ Credentials saved to config.toml");
+                btn.set_label("Saved");
+                if !cid.is_empty() {
+                    account_row_for_save.set_subtitle("Credentials configured. Click 'Sign in with Google' above.");
+                }
+                let b = btn.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_secs(2), move || {
+                    b.set_label("Save");
+                });
+            }
+            Err(e) => {
+                save_creds_row_clone.set_subtitle(&format!("Error saving config: {e}"));
+            }
+        }
+    });
+
+    // Wire auth button click
     auth_btn.connect_clicked(move |_btn| {
         let store_opt = AppConfig::default_credentials_path()
             .ok()
@@ -189,19 +305,34 @@ fn build_ui(app: &adw::Application, config: &AppConfig) {
                     s_row.set_subtitle("Offline (Sign in required)");
                 });
             } else {
-                // Login action
-                let cid = config_auth_ref
-                    .client_id
-                    .clone()
-                    .or_else(|| std::env::var("GOOGLE_CLIENT_ID").ok())
-                    .unwrap_or_default();
-                let csecret = config_auth_ref
-                    .client_secret
-                    .clone()
-                    .or_else(|| std::env::var("GOOGLE_CLIENT_SECRET").ok());
+                // Login action: check client_id_row directly as well
+                let cid_from_entry = client_id_row_for_auth.text().trim().to_string();
+                let csecret_from_entry = client_secret_row_for_auth.text().trim().to_string();
+
+                let (cid, csecret) = {
+                    let mut conf = config_auth_ref.borrow_mut();
+                    if !cid_from_entry.is_empty() {
+                        conf.client_id = Some(cid_from_entry.clone());
+                    }
+                    if !csecret_from_entry.is_empty() {
+                        conf.client_secret = Some(csecret_from_entry.clone());
+                    }
+                    let _ = conf.save();
+
+                    let cid = conf
+                        .client_id
+                        .clone()
+                        .or_else(|| std::env::var("GOOGLE_CLIENT_ID").ok())
+                        .unwrap_or_default();
+                    let csecret = conf
+                        .client_secret
+                        .clone()
+                        .or_else(|| std::env::var("GOOGLE_CLIENT_SECRET").ok());
+                    (cid, csecret)
+                };
 
                 if cid.trim().is_empty() {
-                    account_row_clone.set_subtitle("Client ID required. See docs/GOOGLE_OAUTH.md");
+                    account_row_clone.set_subtitle("Please enter your Client ID in the Google Cloud Credentials section below");
                     return;
                 }
 
@@ -245,7 +376,10 @@ fn build_ui(app: &adw::Application, config: &AppConfig) {
     let config_mount_ref = config_ref.clone();
 
     mount_btn.connect_clicked(move |btn| {
-        let mount_path = config_mount_ref.mount_point.clone();
+        let (mount_path, cache_size_mb) = {
+            let conf = config_mount_ref.borrow();
+            (conf.mount_point.clone(), conf.cache_size_mb)
+        };
         let is_now_mounted = filesystem::is_path_mounted(&mount_path);
 
         if is_now_mounted {
@@ -268,11 +402,33 @@ fn build_ui(app: &adw::Application, config: &AppConfig) {
             }
 
             if let Some(store) = store_opt {
-                let oauth = Arc::new(GoogleOAuthClient::new(OAuthConfig::default(), store));
+                let (cid, csecret) = {
+                    let conf = config_mount_ref.borrow();
+                    let creds_opt = store.load().ok().flatten();
+                    let cid = conf
+                        .client_id
+                        .clone()
+                        .or_else(|| creds_opt.as_ref().and_then(|c| c.client_id.clone()))
+                        .or_else(|| std::env::var("GOOGLE_CLIENT_ID").ok())
+                        .unwrap_or_default();
+                    let csecret = conf
+                        .client_secret
+                        .clone()
+                        .or_else(|| creds_opt.as_ref().and_then(|c| c.client_secret.clone()))
+                        .or_else(|| std::env::var("GOOGLE_CLIENT_SECRET").ok());
+                    (cid, csecret)
+                };
+
+                let oauth_cfg = OAuthConfig {
+                    client_id: cid,
+                    client_secret: csecret,
+                    ..OAuthConfig::default()
+                };
+                let oauth = Arc::new(GoogleOAuthClient::new(oauth_cfg, store));
                 let drive_client =
                     Arc::new(crate::drive::GoogleDriveClient::new(None, None, oauth));
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    let cache = crate::cache::open_default_cache(config_mount_ref.cache_size_mb)
+                    let cache = crate::cache::open_default_cache(cache_size_mb)
                         .ok()
                         .map(|c| Arc::new(std::sync::Mutex::new(c)));
                     match filesystem::mount_filesystem(&mount_path, drive_client, handle, cache) {

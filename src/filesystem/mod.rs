@@ -1,5 +1,9 @@
 use crate::cache::{CacheStorage, CachedFileRecord, FileSyncStatus, MetadataCache};
 use crate::drive::{DriveFile, GoogleDriveClient};
+
+pub mod stream;
+pub use stream::*;
+
 use fuser::{
     BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
     Generation, INodeNo, LockOwner, MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate,
@@ -148,7 +152,7 @@ impl InodeTable {
             drive_id_to_ino: HashMap::new(),
             parent_name_to_ino: HashMap::new(),
             children_of: HashMap::new(),
-            next_ino: AtomicU64::new(4),
+            next_ino: AtomicU64::new(5),
         };
 
         // Initialize root directory (ino = 1) mapped to Google Drive "root"
@@ -168,8 +172,8 @@ impl InodeTable {
             .drive_id_to_ino
             .insert("root".to_string(), FUSER_ROOT_ID);
 
-        // Virtual .trackerignore & .nomedia to prevent desktop indexing engines
-        // (GNOME Tracker, KDE Baloo) from storming the remote FUSE mount.
+        // Virtual .trackerignore, .nomedia & .noindex to prevent desktop indexing engines
+        // (GNOME Tracker, KDE Baloo, media indexers) from storming the remote FUSE mount.
         let tracker_entry = InodeEntry {
             ino: 2,
             drive_id: "virtual_trackerignore".to_string(),
@@ -205,6 +209,24 @@ impl InodeTable {
         table
             .parent_name_to_ino
             .insert((FUSER_ROOT_ID, ".nomedia".to_string()), 3);
+
+        let noindex_entry = InodeEntry {
+            ino: 4,
+            drive_id: "virtual_noindex".to_string(),
+            parent_ino: FUSER_ROOT_ID,
+            name: ".noindex".to_string(),
+            is_dir: false,
+            size: 0,
+            modified_time: SystemTime::now(),
+            mime_type: "text/plain".to_string(),
+        };
+        table.ino_to_entry.insert(4, noindex_entry);
+        table
+            .drive_id_to_ino
+            .insert("virtual_noindex".to_string(), 4);
+        table
+            .parent_name_to_ino
+            .insert((FUSER_ROOT_ID, ".noindex".to_string()), 4);
 
         table
     }
@@ -396,6 +418,8 @@ pub struct GoogleDriveFS {
     next_fh: AtomicU64,
     /// Shared metadata + chunk cache (optional — `None` means caching disabled).
     cache: Option<Arc<Mutex<MetadataCache>>>,
+    /// High-performance sliding window streaming manager for movies and large media.
+    stream_manager: Arc<StreamBufferManager>,
 }
 
 impl GoogleDriveFS {
@@ -427,11 +451,57 @@ impl GoogleDriveFS {
             write_handles: Arc::new(RwLock::new(HashMap::new())),
             next_fh: AtomicU64::new(1),
             cache,
+            stream_manager: Arc::new(StreamBufferManager::new()),
         }
     }
 
     pub fn inode_table(&self) -> Arc<RwLock<InodeTable>> {
         self.inodes.clone()
+    }
+
+    fn load_cached_children(&self, parent_ino: u64, parent_drive_id: &str) -> Option<Vec<InodeEntry>> {
+        let arc_cache = self.cache.as_ref()?;
+        let cache = arc_cache.lock().ok()?;
+        let cached_files = cache.get_children(Some(parent_drive_id)).ok()?;
+        if cached_files.is_empty() {
+            return None;
+        }
+
+        let mut table = self.inodes.write().unwrap();
+        let mut child_inos = Vec::with_capacity(cached_files.len() + 2);
+
+        if parent_ino == FUSER_ROOT_ID {
+            if let Some(ino) = table.get_child_ino(FUSER_ROOT_ID, ".trackerignore") {
+                child_inos.push(ino);
+            }
+            if let Some(ino) = table.get_child_ino(FUSER_ROOT_ID, ".nomedia") {
+                child_inos.push(ino);
+            }
+            if let Some(ino) = table.get_child_ino(FUSER_ROOT_ID, ".noindex") {
+                child_inos.push(ino);
+            }
+        }
+
+        for rec in &cached_files {
+            let drive_file = DriveFile {
+                id: rec.drive_id.clone(),
+                name: rec.name.clone(),
+                mime_type: rec.mime_type.clone(),
+                size: Some(rec.size.to_string()),
+                modified_time: Some(rec.modified_time.clone()),
+                created_time: None,
+                parents: rec.parent_id.clone().map(|p| vec![p]),
+                trashed: Some(false),
+                web_view_link: None,
+                md5_checksum: rec.etag.clone(),
+                version: None,
+            };
+            let ino = table.insert_or_update(parent_ino, &drive_file);
+            child_inos.push(ino);
+        }
+
+        table.set_children(parent_ino, child_inos);
+        table.get_children(parent_ino)
     }
 
     fn fetch_children_from_drive(&self, parent_ino: u64, parent_drive_id: &str) -> Vec<InodeEntry> {
@@ -442,45 +512,14 @@ impl GoogleDriveFS {
                     .is_directory_fresh(parent_drive_id, Duration::from_secs(120))
                     .unwrap_or(false)
                 {
-                    if let Ok(cached_files) = cache.get_children(Some(parent_drive_id)) {
+                    drop(cache);
+                    if let Some(entries) = self.load_cached_children(parent_ino, parent_drive_id) {
                         debug!(
                             "SQLite directory cache HIT for {}: loaded {} files",
                             parent_drive_id,
-                            cached_files.len()
+                            entries.len()
                         );
-                        let mut table = self.inodes.write().unwrap();
-                        let mut child_inos = Vec::with_capacity(cached_files.len() + 2);
-
-                        if parent_ino == FUSER_ROOT_ID {
-                            if let Some(ino) = table.get_child_ino(FUSER_ROOT_ID, ".trackerignore")
-                            {
-                                child_inos.push(ino);
-                            }
-                            if let Some(ino) = table.get_child_ino(FUSER_ROOT_ID, ".nomedia") {
-                                child_inos.push(ino);
-                            }
-                        }
-
-                        for rec in &cached_files {
-                            let drive_file = DriveFile {
-                                id: rec.drive_id.clone(),
-                                name: rec.name.clone(),
-                                mime_type: rec.mime_type.clone(),
-                                size: Some(rec.size.to_string()),
-                                modified_time: Some(rec.modified_time.clone()),
-                                created_time: None,
-                                parents: rec.parent_id.clone().map(|p| vec![p]),
-                                trashed: Some(false),
-                                web_view_link: None,
-                                md5_checksum: rec.etag.clone(),
-                                version: None,
-                            };
-                            let ino = table.insert_or_update(parent_ino, &drive_file);
-                            child_inos.push(ino);
-                        }
-
-                        table.set_children(parent_ino, child_inos);
-                        return table.get_children(parent_ino).unwrap_or_default();
+                        return entries;
                     }
                 }
             }
@@ -530,6 +569,9 @@ impl GoogleDriveFS {
                     if let Some(ino) = table.get_child_ino(FUSER_ROOT_ID, ".nomedia") {
                         child_inos.push(ino);
                     }
+                    if let Some(ino) = table.get_child_ino(FUSER_ROOT_ID, ".noindex") {
+                        child_inos.push(ino);
+                    }
                 }
 
                 for file in &files {
@@ -541,7 +583,19 @@ impl GoogleDriveFS {
                 table.get_children(parent_ino).unwrap_or_default()
             }
             Err(e) => {
-                error!("Failed to fetch children for {}: {}", parent_drive_id, e);
+                warn!(
+                    "Failed to fetch children for {}: {}. Attempting cache fallback...",
+                    parent_drive_id, e
+                );
+                // Fallback to SQLite cache if available, even if TTL expired!
+                if let Some(entries) = self.load_cached_children(parent_ino, parent_drive_id) {
+                    info!(
+                        "Served {} cached entries for {} from local SQLite cache during remote failure.",
+                        entries.len(),
+                        parent_drive_id
+                    );
+                    return entries;
+                }
                 Vec::new()
             }
         }
@@ -559,8 +613,11 @@ impl GoogleDriveFS {
 }
 
 impl Filesystem for GoogleDriveFS {
-    fn init(&mut self, _req: &Request, _config: &mut fuser::KernelConfig) -> std::io::Result<()> {
+    fn init(&mut self, _req: &Request, config: &mut fuser::KernelConfig) -> std::io::Result<()> {
         info!("Google Drive FUSE filesystem initialized (read-write mode).");
+        let _ = config.set_max_readahead(1024 * 1024); // 1 MB kernel read-ahead for high streaming throughput
+        let _ = config.set_max_background(64);
+        let _ = config.set_congestion_threshold(48);
         Ok(())
     }
 
@@ -861,8 +918,8 @@ impl Filesystem for GoogleDriveFS {
             debug!("Opened ino={} for writing as fh={}", ino_val, fh);
             reply.opened(FileHandle(fh), FopenFlags::empty());
         } else {
-            // Read-only open
-            reply.opened(FileHandle(0), FopenFlags::empty());
+            // Read-only open: instruct the kernel to keep page cache across opens
+            reply.opened(FileHandle(0), FopenFlags::FOPEN_KEEP_CACHE);
         }
     }
 
@@ -961,24 +1018,24 @@ impl Filesystem for GoogleDriveFS {
         let read_len = (size as u64).min(entry.size - offset);
         let drive_id = entry.drive_id.clone();
 
-        // --- Cache read path ---
-        // For small reads (size <= full file size) where the whole file is already
-        // cached locally, serve directly from the chunk file.
+        // --- 1. Direct local chunk cache read (zero-copy, lock-free slice read) ---
+        // Reads directly from the locally cached file on disk using read_exact_at without
+        // loading the entire file into memory or holding the SQLite cache lock.
         if let Some(ref arc_cache) = self.cache {
-            if let Ok(cache) = arc_cache.lock() {
-                if let Ok(Some(rec)) = cache.get_file_record(&drive_id) {
-                    if rec.sync_status == FileSyncStatus::Cached {
-                        if let Ok(Some(full_bytes)) = cache.load_chunk(&drive_id) {
-                            let start = offset as usize;
-                            let end = (start + read_len as usize).min(full_bytes.len());
-                            if start < full_bytes.len() {
-                                debug!(
-                                    "Cache HIT: serving {} bytes from local chunk for {}",
-                                    end - start,
-                                    drive_id
-                                );
-                                reply.data(&full_bytes[start..end]);
-                                return;
+            let chunk_path = arc_cache.lock().ok().map(|c| c.chunk_path(&drive_id));
+            if let Some(path) = chunk_path {
+                if path.exists() {
+                    if let Ok(file) = File::open(&path) {
+                        if let Ok(meta) = file.metadata() {
+                            let file_len = meta.len();
+                            if offset < file_len {
+                                let to_read = (read_len as usize).min((file_len - offset) as usize);
+                                let mut buf = vec![0u8; to_read];
+                                use std::os::unix::fs::FileExt;
+                                if let Ok(()) = file.read_exact_at(&mut buf, offset) {
+                                    reply.data(&buf);
+                                    return;
+                                }
                             }
                         }
                     }
@@ -986,13 +1043,12 @@ impl Filesystem for GoogleDriveFS {
             }
         }
 
-        // --- Drive API fallback ---
-        let client = self.client.clone();
+        // --- 2. Full download & disk cache for files <= 32 MB (images, audio, docs) ---
+        // For files up to 32 MB, downloading the full file once enables instant zero-latency
+        // local disk access for all subsequent reads and future opens.
+        const CACHE_THRESHOLD: u64 = 32 * 1024 * 1024;
         let did = drive_id.clone();
-        const CACHE_THRESHOLD: u64 = 16 * 1024 * 1024;
 
-        // If file is small enough (<= 16 MB), download and cache the entire file once!
-        // This makes all subsequent sequential chunk reads (e.g. 80 chunks) instant local cache hits.
         if entry.size > 0 && entry.size <= CACHE_THRESHOLD {
             let client_for_full = self.client.clone();
             let did_clone = did.clone();
@@ -1042,10 +1098,19 @@ impl Filesystem for GoogleDriveFS {
             }
         }
 
-        // For large files (> 16 MB) or if full download failed: range request
-        let chunk_res = self
-            .rt_handle
-            .block_on(async move { client.download_file_range(&did, offset, read_len).await });
+        // --- 3. High-performance streaming buffer with read-ahead (movies & large files) ---
+        // Uses 4 MB chunk caching and proactive background prefetching to ensure smooth,
+        // buffer-free video playback and instant seeking.
+        let client = self.client.clone();
+        let sm = self.stream_manager.clone();
+        let rt = self.rt_handle.clone();
+        let file_size = entry.size;
+        let did_stream = drive_id.clone();
+
+        let chunk_res = self.rt_handle.block_on(async move {
+            sm.read_range(&client, &did_stream, file_size, offset, read_len, &rt)
+                .await
+        });
 
         match chunk_res {
             Ok(data) => {
@@ -1344,6 +1409,9 @@ impl Filesystem for GoogleDriveFS {
 
         // Only upload if this was a writable handle (fh != 0)
         if fh_val == 0 {
+            if let Some(entry) = self.inodes.read().unwrap().get_by_ino(ino_val) {
+                self.stream_manager.release_file(&entry.drive_id);
+            }
             reply.ok();
             return;
         }
@@ -1726,7 +1794,16 @@ pub fn mount_filesystem(
         MountOption::FSName("GoogleDrive".to_string()),
         MountOption::Subtype("google-drive-linux".to_string()),
         MountOption::NoSuid,
+        MountOption::NoDev,
+        MountOption::NoAtime,
+        MountOption::Async,
     ];
+
+    let n_threads = std::thread::available_parallelism()
+        .map(|n| n.get().clamp(4, 16))
+        .unwrap_or(4);
+    config.n_threads = Some(n_threads);
+    config.clone_fd = true;
 
     let session = fuser::spawn_mount(fs, mount_point, &config)
         .map_err(|e| FsError::MountFailed(e.to_string()))?;
@@ -1988,6 +2065,12 @@ mod tests {
         let nomedia_entry = table.get_by_ino(3).expect("nomedia entry");
         assert_eq!(nomedia_entry.name, ".nomedia");
         assert_eq!(nomedia_entry.size, 0);
+
+        let noindex_ino = table.get_child_ino(FUSER_ROOT_ID, ".noindex");
+        assert_eq!(noindex_ino, Some(4));
+        let noindex_entry = table.get_by_ino(4).expect("noindex entry");
+        assert_eq!(noindex_entry.name, ".noindex");
+        assert_eq!(noindex_entry.size, 0);
     }
 
     #[test]
@@ -1995,7 +2078,7 @@ mod tests {
         let mut table = InodeTable::new();
         assert!(!table.has_children_cached(FUSER_ROOT_ID));
 
-        table.set_children(FUSER_ROOT_ID, vec![2, 3]);
+        table.set_children(FUSER_ROOT_ID, vec![2, 3, 4]);
         assert!(table.has_children_cached(FUSER_ROOT_ID));
     }
 }

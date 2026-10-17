@@ -234,8 +234,18 @@ pub struct GoogleOAuthClient {
 }
 
 impl GoogleOAuthClient {
-    pub fn new(config: OAuthConfig, token_store: TokenStore) -> Self {
+    pub fn new(mut config: OAuthConfig, token_store: TokenStore) -> Self {
         let initial_creds = token_store.load().ok().flatten();
+        if config.client_id.trim().is_empty() {
+            if let Some(ref c) = initial_creds {
+                if let Some(ref cid) = c.client_id {
+                    config.client_id = cid.clone();
+                }
+                if config.client_secret.is_none() && c.client_secret.is_some() {
+                    config.client_secret = c.client_secret.clone();
+                }
+            }
+        }
         Self {
             config,
             http: Client::new(),
@@ -529,16 +539,34 @@ impl GoogleOAuthClient {
             ));
         }
 
+        let cid = if !self.config.client_id.trim().is_empty() {
+            self.config.client_id.as_str()
+        } else if let Some(ref c_id) = creds.client_id {
+            c_id.as_str()
+        } else {
+            ""
+        };
+
+        if cid.trim().is_empty() {
+            return Err(AuthError::Config(
+                "Google Client ID is missing. Cannot refresh access token without client_id.".to_string(),
+            ));
+        }
+
         let mut params = vec![
             ("grant_type", "refresh_token"),
             ("refresh_token", creds.refresh_token.as_str()),
-            ("client_id", self.config.client_id.as_str()),
+            ("client_id", cid),
         ];
 
-        let secret_ref;
-        if let Some(ref sec) = self.config.client_secret {
-            secret_ref = sec.as_str();
-            params.push(("client_secret", secret_ref));
+        let secret_ref = self
+            .config
+            .client_secret
+            .as_deref()
+            .or(creds.client_secret.as_deref());
+
+        if let Some(sec) = secret_ref {
+            params.push(("client_secret", sec));
         }
 
         let resp = self
@@ -561,6 +589,12 @@ impl GoogleOAuthClient {
         creds.expires_at = StoredCredentials::now_epoch() + token_data.expires_in;
         if let Some(new_rt) = token_data.refresh_token {
             creds.refresh_token = new_rt;
+        }
+        if creds.client_id.is_none() && !cid.is_empty() {
+            creds.client_id = Some(cid.to_string());
+        }
+        if creds.client_secret.is_none() && secret_ref.is_some() {
+            creds.client_secret = secret_ref.map(str::to_string);
         }
 
         Ok(())
@@ -749,5 +783,55 @@ mod tests {
         client.token_store().save(&creds).expect("save");
         client.logout().await.expect("logout should succeed");
         assert_eq!(client.token_store().load().expect("load"), None);
+    }
+
+    #[tokio::test]
+    async fn test_token_refresh_uses_stored_client_id_when_config_empty() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+        let mock_port = listener.local_addr().expect("port").port();
+
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+
+                if req.contains("grant_type=refresh_token") && req.contains("client_id=stored_client_xyz") {
+                    let body = r#"{"access_token":"refreshed_from_stored_id","expires_in":3600,"token_type":"Bearer"}"#;
+                    let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                }
+            }
+        });
+
+        let dir = tempdir().expect("tempdir");
+        let store = TokenStore::new(dir.path().join("creds.json"));
+
+        let mut stored_creds = StoredCredentials {
+            access_token: "expired_token".to_string(),
+            refresh_token: "mock_refresh_token".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_at: 0,
+            account_email: Some("test@gmail.com".to_string()),
+            account_name: None,
+            client_id: Some("stored_client_xyz".to_string()),
+            client_secret: None,
+        };
+        store.save(&stored_creds).expect("save creds");
+
+        // Pass OAuthConfig with EMPTY client_id
+        let config = OAuthConfig {
+            token_endpoint: format!("http://127.0.0.1:{mock_port}/token"),
+            client_id: String::new(),
+            ..OAuthConfig::default()
+        };
+
+        let client = GoogleOAuthClient::new(config, store);
+        client
+            .refresh_access_token(&mut stored_creds)
+            .await
+            .expect("should refresh using stored client_id");
+
+        assert_eq!(stored_creds.access_token, "refreshed_from_stored_id");
     }
 }
